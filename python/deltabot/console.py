@@ -9,10 +9,118 @@ import argparse
 import cmd
 import shlex
 import sys
+import time
+from typing import Optional
 
 from .config import Geometry
 from .controller import DeltaBot, DeltaBotError, list_ports
 from .kinematics import common_mode
+
+
+def _switch_line(states) -> str:
+    return "  ".join(f"{i}:{'TRIPPED' if on else 'ok'}" for i, on in enumerate(states))
+
+
+def watch_switches(bot: DeltaBot, seconds: Optional[float] = None,
+                   poll: float = 0.02) -> list:
+    """Print the limit switches live: one line per change, until Ctrl-C (or
+    ``seconds``), then how many changes each switch made.  Nothing moves.
+
+    Press and release each switch a few times.  With normally closed wiring a
+    working switch reads ok when released and TRIPPED while pressed; one that
+    reads TRIPPED throughout is not reaching GND."""
+    states = bot.limit_switches()
+    counts = [0, 0, 0]
+    print("  watching switches (screw 0: D9, 1: D10, 2: D11) - press and release each;"
+          + (" Ctrl-C to stop" if seconds is None else f" {seconds:g} s"))
+    print(f"    0.00 s  {_switch_line(states)}")
+    t0 = time.time()
+    try:
+        while seconds is None or time.time() - t0 < seconds:
+            time.sleep(poll)
+            now = bot.limit_switches()
+            for i in range(3):
+                if now[i] != states[i]:
+                    counts[i] += 1
+                    change = "pressed  -> TRIPPED" if now[i] else "released -> ok"
+                    print(f"  {time.time() - t0:6.2f} s  switch {i} (D{9 + i}) {change:20s}"
+                          f"  [{_switch_line(now)}]")
+            states = now
+    except KeyboardInterrupt:
+        # A reply may still be on its way; drop it so the next command is clean.
+        time.sleep(0.1)
+        bot.serial.reset_input_buffer()
+        print()
+    for i in range(3):
+        if counts[i]:
+            verdict = f"{counts[i]} changes - working"
+        elif states[i]:
+            verdict = ("never changed, stuck TRIPPED - not reaching GND: check it is "
+                       "connected, COM to GND, NC (not NO) to the pin")
+        else:
+            verdict = "never changed, stayed ok - not pressed, or its pin is shorted to GND"
+        print(f"  switch {i} (D{9 + i}): {verdict}")
+    return counts
+
+
+# What each pin is for, as the firmware and the GRBL shield use them.
+PIN_ROLES = {
+    "D2": "output: dir, screw 2", "D3": "output: dir, screw 1", "D4": "output: dir, screw 0",
+    "D5": "output: step, screw 2", "D6": "output: step, screw 1", "D7": "output: step, screw 0",
+    "D8": "output: driver enable",
+    "D9": "limit switch, screw 0", "D10": "limit switch, screw 1",
+    "D11": "limit switch, screw 2",
+    "D12": "spare (shield Z limit header on V3.51+)",
+    "D13": "spare (Nano LED - may not read cleanly)",
+    "A0": "spare (shield Abort header)", "A1": "spare (shield Hold header)",
+    "A2": "spare (shield Resume header)", "A3": "spare (shield Coolant header)",
+    "A4": "spare (SDA)", "A5": "spare (SCL)",
+}
+OUTPUT_PINS = {"D2", "D3", "D4", "D5", "D6", "D7", "D8"}
+
+
+def watch_pins(bot: DeltaBot, seconds: Optional[float] = None,
+               poll: float = 0.02) -> dict:
+    """Print every input pin live - D9..D13 and A0..A5 - one line per change,
+    until Ctrl-C (or ``seconds``), then which pins changed.  Nothing moves.
+
+    Every input has the internal pull-up, so a pin with nothing on it reads 1.
+    A normally closed switch to GND reads 0 at rest and 1 while pressed:
+    press each switch and see which pin answers."""
+    levels = bot.pin_levels()
+    inputs = [p for p in levels if p not in OUTPUT_PINS]
+    counts = {p: 0 for p in inputs}
+    print("  pin levels now (1 = high; inputs are pulled up, so 0 means tied to GND):")
+    for p in levels:
+        print(f"    {p:>3}  {levels[p]}   {PIN_ROLES[p]}")
+    grounded = [p for p in inputs if p not in ("D9", "D10", "D11") and not levels[p]]
+    if grounded:
+        print("  spare pins held at GND - a normally closed switch may be wired here: "
+              + ", ".join(grounded))
+    print("  watching inputs - press and release each switch;"
+          + (" Ctrl-C to stop" if seconds is None else f" {seconds:g} s"))
+    t0 = time.time()
+    try:
+        while seconds is None or time.time() - t0 < seconds:
+            time.sleep(poll)
+            now = bot.pin_levels()
+            for p in inputs:
+                if now[p] != levels[p]:
+                    counts[p] += 1
+                    print(f"  {time.time() - t0:6.2f} s  {p:>3}  {levels[p]} -> {now[p]}"
+                          f"   {PIN_ROLES[p]}")
+            levels = now
+    except KeyboardInterrupt:
+        time.sleep(0.1)
+        bot.serial.reset_input_buffer()
+        print()
+    changed = [p for p in inputs if counts[p]]
+    if changed:
+        for p in changed:
+            print(f"  {p:>3}: {counts[p]} changes   {PIN_ROLES[p]}")
+    else:
+        print("  no input pin changed")
+    return counts
 
 
 class DeltaBotConsole(cmd.Cmd):
@@ -54,6 +162,10 @@ class DeltaBotConsole(cmd.Cmd):
               f"speed {s['speed']:.0f} steps/s   accel {s['accel']:.0f} steps/s^2")
         print(f"  limits  {s['limits'][0]} .. {s['limits'][1]} steps "
               f"(+/-{s['limits'][1] / self.bot.geometry.steps_per_mm:.2f} mm)")
+        if "sw" in s:
+            print(f"  switches {_switch_line(s['sw'])}")
+        else:
+            print("  switches  not reported - firmware older than DeltaBot 1.1")
         self._show()
 
     def do_pose(self, arg):
@@ -123,6 +235,33 @@ class DeltaBotConsole(cmd.Cmd):
         """home - send every screw back to zero, and the platform to centre."""
         self.bot.home()
         self._show()
+
+    def do_switches(self, arg):
+        """switches - watch the limit switches live until Ctrl-C.  Press and
+        release each one; every change is printed.  Nothing moves."""
+        watch_switches(self.bot)
+
+    def do_pins(self, arg):
+        """pins - watch every input pin live until Ctrl-C, to find which pin
+        each switch is really wired to.  Nothing moves."""
+        watch_pins(self.bot)
+
+    def _axes(self, arg):
+        # Also takes the IPython spelling, e.g. 'calibrate_home(2)'.
+        arg = arg.strip().strip("()").replace(",", " ")
+        return [int(a) for a in shlex.split(arg)] or [0, 1, 2]
+
+    def do_calhome(self, arg):
+        """calhome [screws] - from roughly neutral, home each screw in turn:
+        a balanced move down onto its switch, then back up home_offset_mm
+        (5 mm), which becomes that screw's zero.  'calhome 2' does screw 2
+        only; the others keep their zero."""
+        self.bot.find_home(self._axes(arg))
+        self._show()
+
+    do_findhome = do_calhome              # same routine, older name
+    do_find_home = do_calhome             # the IPython names work here too
+    do_calibrate_home = do_calhome
 
     def do_zero(self, arg):
         """zero - call the current position the origin."""
@@ -228,6 +367,10 @@ def main(argv=None):
     parser.add_argument("--microsteps", type=int, default=None,
                         help="microstepping set by the driver jumpers")
     parser.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
+    parser.add_argument("--switches", action="store_true",
+                        help="watch the limit switches until Ctrl-C, then exit")
+    parser.add_argument("--pins", action="store_true",
+                        help="watch every input pin until Ctrl-C, then exit")
     args = parser.parse_args(argv)
 
     if args.list_ports:
@@ -250,6 +393,15 @@ def main(argv=None):
         return 1
 
     print(f"connected to {bot.conn.port}: {bot.banner}")
+    if args.switches or args.pins:
+        try:
+            (watch_pins if args.pins else watch_switches)(bot)
+        except DeltaBotError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            bot.close()
+        return 0
     try:
         DeltaBotConsole(bot).cmdloop()
     except KeyboardInterrupt:

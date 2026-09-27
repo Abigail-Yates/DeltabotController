@@ -12,6 +12,8 @@
    Protocol: one ASCII command per line, terminated with '\n'.  Every command
    answers with one or more data lines followed by "ok" or "err <reason>".
    When a move finishes the firmware emits an unsolicited "done" line.
+   If a limit switch trips during a move, every axis stops dead and the
+   firmware emits an unsolicited "limit n" line instead.
 
      M a b c   move to absolute step positions
      R a b c   move by a relative number of steps
@@ -23,15 +25,27 @@
      E 0|1     disable / enable the drivers
      Z         set the current position as zero
      Z a b c   force the current position to a b c (no motion)
-     B lo hi   set the soft limits, in steps (lo == hi disables them)
+     B lo hi   set the soft limits, in steps (lo == hi disables them); a
+               move that brings an axis back towards them is always allowed
      S         stop, decelerating
      X         emergency stop, immediate
+     I         raw pin levels           -> "pins <D2..D13> <A0..A5>", 0/1 each
      $         print this command summary
+
+   Limit switches: one per screw, on D9, D10 and D11, using the switch's
+   normally closed contact between the pin and GND.  The internal pull-up
+   holds the pin HIGH, so it reads LOW normally and HIGH when the switch is
+   pressed - or when a wire breaks, which then stops the machine too.  The
+   firmware remembers which way the screw was travelling when its switch
+   tripped and refuses further moves that way ("err limit n") until it is
+   released; moves back off the switch are always allowed.  A switch that is
+   already tripped at power up, or pressed by hand while the screw is idle,
+   blocks nothing because the direction is unknown.
 */
 
 #include <AccelStepper.h>
 
-#define FIRMWARE_ID "DeltaBot 1.0"
+#define FIRMWARE_ID "DeltaBot 1.2"
 
 // ---------------------------------------------------------------- pin map
 // GRBL shield: EN is active low and shared by all three drivers.
@@ -42,7 +56,22 @@ const uint8_t STEP_PIN[3] = {7, 6, 5};
 const uint8_t DIR_PIN[3]  = {4, 3, 2};
 
 // Flip an entry to true if positive steps drive that corner the wrong way.
-const bool DIR_INVERT[3] = {false, false, false};
+// Positive steps should drive every nut down towards its limit switch:
+// clockwise seen from the back of the motor, anticlockwise from the shaft
+// end.  Motor 1 is wired the other way round to motors 0 and 2.
+const bool DIR_INVERT[3] = {true, false, true};
+
+// Limit switches: normally closed contact from pin to GND, internal pull-up.
+// Pressed (or a broken wire) reads HIGH.  For normally open switches to GND,
+// change LIMIT_ACTIVE to LOW - but then a broken wire goes unnoticed.
+const uint8_t LIMIT_PIN[3] = {9, 10, 11};
+const uint8_t LIMIT_ACTIVE = HIGH;
+const unsigned long LIMIT_RELEASE_MS = 20;   // clear this long to count as released
+
+// Pins the firmware does not use.  They get the internal pull-up too, so the
+// I command shows a switch that has been wired to the wrong pin.  D13 carries
+// the Nano's LED, which fights the pull-up and may not read cleanly.
+const uint8_t SPARE_PIN[] = {12, 13, A0, A1, A2, A3, A4, A5};
 
 // ------------------------------------------------------------- parameters
 const float DEFAULT_SPEED = 600.0;    // steps/s   (28BYJ-48 stalls if pushed)
@@ -61,6 +90,10 @@ long  softMax  =  400000L;
 bool  enabled  = true;
 bool  moving   = false;
 
+bool  limitHit[3]  = {false, false, false};
+int8_t limitDir[3] = {0, 0, 0};              // travel direction that tripped it, 0 = unknown
+unsigned long limitSeen[3] = {0, 0, 0};      // millis() the switch last read tripped
+
 char  line[64];
 uint8_t lineLen = 0;
 
@@ -70,9 +103,63 @@ void setEnabled(bool on) {
   digitalWrite(EN_PIN, on ? LOW : HIGH);   // active low
 }
 
-bool withinLimits(long target) {
+// A target outside the soft limits is still allowed if it is no further out
+// than the axis is now, so an axis beyond them (after homing, say, or sitting
+// on a limit switch) can always be brought back, and the other axes moved.
+bool withinLimits(long target, long current) {
   if (softMin == softMax) return true;     // limits disabled
-  return target >= softMin && target <= softMax;
+  if (target > softMax) return target <= current;
+  if (target < softMin) return target >= current;
+  return true;
+}
+
+// The first axis whose tripped limit switch this target would drive further
+// into, or -1 if the move is clear.
+int8_t blockedByLimit(long target[3]) {
+  for (uint8_t i = 0; i < 3; i++) {
+    if (!limitHit[i] || limitDir[i] == 0) continue;
+    long d = target[i] - stepper[i].currentPosition();
+    if ((d > 0 && limitDir[i] > 0) || (d < 0 && limitDir[i] < 0)) return i;
+  }
+  return -1;
+}
+
+void haltAll() {
+  for (uint8_t i = 0; i < 3; i++) stepper[i].setCurrentPosition(stepper[i].currentPosition());
+  moving = false;
+}
+
+// A switch counts as tripped from its first active reading, so a move is
+// stopped at first contact, and as released only once it has read clear for
+// LIMIT_RELEASE_MS, so contact bounce while backing off cannot re-trigger it.
+void pollLimits() {
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < 3; i++) {
+    if (digitalRead(LIMIT_PIN[i]) == LIMIT_ACTIVE) {
+      limitSeen[i] = now;
+      if (!limitHit[i]) {
+        limitHit[i] = true;
+        long d = stepper[i].distanceToGo();
+        limitDir[i] = (d > 0) ? 1 : (d < 0) ? -1 : 0;
+        if (limitDir[i] != 0) {
+          haltAll();
+          Serial.print(F("limit "));
+          Serial.println(i);
+        }
+      }
+    } else if (limitHit[i] && now - limitSeen[i] >= LIMIT_RELEASE_MS) {
+      limitHit[i] = false;
+      limitDir[i] = 0;
+    }
+  }
+}
+
+bool rejectIfLimited(long target[3]) {
+  int8_t axis = blockedByLimit(target);
+  if (axis < 0) return false;
+  Serial.print(F("err limit "));
+  Serial.println(axis);
+  return true;
 }
 
 // Scale each axis so that all three finish together: the axis with the
@@ -116,12 +203,24 @@ void reportStatus() {
   Serial.print(F("en ")); Serial.print(enabled ? 1 : 0);
   Serial.print(F(" speed ")); Serial.print(maxSpeed);
   Serial.print(F(" accel ")); Serial.print(accel);
-  Serial.print(F(" limits ")); Serial.print(softMin); Serial.print(' '); Serial.println(softMax);
+  Serial.print(F(" limits ")); Serial.print(softMin); Serial.print(' '); Serial.print(softMax);
+  Serial.print(F(" sw "));
+  for (uint8_t i = 0; i < 3; i++) { Serial.print(limitHit[i] ? 1 : 0); Serial.print(i < 2 ? ' ' : '\n'); }
+}
+
+// D2..D13 then A0..A5 (A6/A7 are analog only).  Outputs read back whatever
+// they are driving.
+void reportPins() {
+  Serial.print(F("pins "));
+  for (uint8_t p = 2; p <= 13; p++) Serial.print(digitalRead(p));
+  Serial.print(' ');
+  for (uint8_t p = A0; p <= A5; p++) Serial.print(digitalRead(p));
+  Serial.println();
 }
 
 void printHelp() {
   Serial.println(F("M a b c | R a b c | J n d | P | ? | V v | A a | E 0|1"));
-  Serial.println(F("Z [a b c] | B lo hi | S | X | $"));
+  Serial.println(F("Z [a b c] | B lo hi | S | X | I | $"));
 }
 
 // Pull up to `count` whitespace separated longs out of `s`.
@@ -153,7 +252,10 @@ void handleLine(char *s) {
       for (uint8_t i = 0; i < 3; i++)
         target[i] = (cmd == 'M') ? v[i] : stepper[i].currentPosition() + v[i];
       for (uint8_t i = 0; i < 3; i++)
-        if (!withinLimits(target[i])) { Serial.println(F("err soft limit")); return; }
+        if (!withinLimits(target[i], stepper[i].currentPosition())) {
+          Serial.println(F("err soft limit")); return;
+        }
+      if (rejectIfLimited(target)) return;
       if (!enabled) setEnabled(true);
       startMove(target);
       Serial.println(F("ok"));
@@ -165,7 +267,10 @@ void handleLine(char *s) {
       long target[3];
       for (uint8_t i = 0; i < 3; i++) target[i] = stepper[i].targetPosition();
       target[v[0]] = stepper[v[0]].currentPosition() + v[1];
-      if (!withinLimits(target[v[0]])) { Serial.println(F("err soft limit")); return; }
+      if (!withinLimits(target[v[0]], stepper[v[0]].currentPosition())) {
+        Serial.println(F("err soft limit")); return;
+      }
+      if (rejectIfLimited(target)) return;
       if (!enabled) setEnabled(true);
       startMove(target);
       Serial.println(F("ok"));
@@ -218,10 +323,10 @@ void handleLine(char *s) {
       Serial.println(F("ok"));
       break;
     case 'X':
-      for (uint8_t i = 0; i < 3; i++) stepper[i].setCurrentPosition(stepper[i].currentPosition());
-      moving = false;
+      haltAll();
       Serial.println(F("ok"));
       break;
+    case 'I': reportPins();     Serial.println(F("ok")); break;
     case '$': printHelp(); Serial.println(F("ok")); break;
     default:  Serial.println(F("err unknown command")); break;
   }
@@ -249,6 +354,8 @@ void pollSerial() {
 void setup() {
   pinMode(EN_PIN, OUTPUT);
   setEnabled(true);
+  for (uint8_t i = 0; i < 3; i++) pinMode(LIMIT_PIN[i], INPUT_PULLUP);
+  for (uint8_t i = 0; i < sizeof(SPARE_PIN); i++) pinMode(SPARE_PIN[i], INPUT_PULLUP);
 
   for (uint8_t i = 0; i < 3; i++) {
     stepper[i].setPinsInverted(DIR_INVERT[i], false, false);
@@ -264,6 +371,7 @@ void setup() {
 
 void loop() {
   pollSerial();
+  pollLimits();
 
   bool busy = false;
   for (uint8_t i = 0; i < 3; i++) {

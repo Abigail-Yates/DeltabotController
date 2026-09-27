@@ -15,6 +15,8 @@ The prompt then has:
     wh()  mv(x, y)  mvr(dx, dy)                   plane, mm
     wm()  mvm(m0, m1, m2)  mvrm(m0, m1, m2)       raw motors, steps
     zero()                                        current position becomes the origin
+    calibrate_home(*screws)  find_home(*screws)   zero from the limit switches
+    watch_switches()  watch_pins()                live switch / pin test, Ctrl-C to stop
     ascan  dscan  mesh  dmesh  mmesh  dmmesh  run_scan  count
     Circles  Peaks  SaveImage  Custom
     load_scan  connect_camera  scanner
@@ -25,6 +27,8 @@ import atexit
 
 from .camera import Camera
 from .config import Geometry
+from .console import watch_pins as _watch_pins
+from .console import watch_switches as _watch_switches
 from .controller import DeltaBot
 from .kinematics import common_mode, screws_to_pose
 from .scan import Circles, Custom, Peaks, SaveImage, Scanner, ScanData, load_scan
@@ -110,7 +114,7 @@ def main(argv=None) -> dict:
     def zero():
         """Make the current position the origin: motors 0 steps, x = y = 0.
 
-        The machine has no endstops, so this is its only reference.  Any
+        find_home() re-derives it from the limit switches instead.  Any
         preload present (from raw motor moves) becomes part of the new zero
         and stays in every later move."""
         steps = bot.positions()
@@ -123,12 +127,31 @@ def main(argv=None) -> dict:
             print(f"  note: {strain:+.4f} mm of preload is now part of the zero")
         wm()
 
+    def find_home(*axes):
+        """From roughly neutral, home each screw in turn (all three, or the
+        screws given, e.g. find_home(2)): a balanced move down onto its
+        switch, then back up 5 mm, which becomes that screw's zero."""
+        bot.find_home(axes or (0, 1, 2))
+        wh()
+
+    calibrate_home = find_home
+
+    def watch_switches(seconds=None):
+        """Print each limit switch change live until Ctrl-C; nothing moves."""
+        return _watch_switches(bot, seconds)
+
+    def watch_pins(seconds=None):
+        """Print every input pin change live until Ctrl-C; nothing moves."""
+        return _watch_pins(bot, seconds)
+
     print(f"DeltaBot on {bot.conn.port}: {bot.banner}")
     print(f"camera: {cam if cam else 'not connected'}   scans -> {opts.data_dir}/")
     print(__doc__.split("The prompt then has:")[1].rstrip())
     return dict(
         bot=bot, cam=cam, scanner=scanner, connect_camera=connect_camera,
         wh=wh, mv=mv, mvr=mvr, wm=wm, mvm=mvm, mvrm=mvrm, zero=zero,
+        find_home=find_home, calibrate_home=calibrate_home,
+        watch_switches=watch_switches, watch_pins=watch_pins,
         ascan=scanner.ascan, dscan=scanner.dscan, mesh=scanner.mesh,
         dmesh=scanner.dmesh, mmesh=scanner.mmesh, dmmesh=scanner.dmmesh,
         run_scan=scanner.run, count=scanner.count,

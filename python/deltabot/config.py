@@ -58,6 +58,35 @@ class Geometry:
     # Used to build the firmware's soft limits.
     travel_mm: float = 4.0
 
+    # Homing on the limit switches (see DeltaBot.find_home).  +1 if a screw
+    # reaches its switch by extending, -1 by retracting.  On this machine
+    # the firmware's DIR_INVERT makes positive steps drive the nut down onto
+    # the switch, so +1 (with direction = +1).
+    home_direction: Tuple[int, int, int] = (1, 1, 1)
+
+    # The switches trip about 5 mm below neutral.  Homing finds a switch,
+    # then comes back up this far, and that point is the screw's zero.
+    home_offset_mm: float = 5.0
+
+    # Homing starts from roughly neutral, so each screw searches down
+    # home_offset_mm plus this much before giving up.
+    home_search_margin_mm: float = 1.5
+
+    # While one screw homes, the balanced move turns the other two away from
+    # their switches, where nothing would stop them.  They go at most this
+    # far from where homing started, enough for a fully balanced search;
+    # past that the homing screw would carry on alone.
+    home_away_max_mm: float = 3.5
+
+    # Back off the switch in steps of this much until it releases, then one
+    # step more; go back quickly to this far short of where it tripped, and
+    # cover the rest slowly.  Give up if it has not released after
+    # home_release_max_mm.
+    home_backoff_mm: float = 0.2
+    home_release_max_mm: float = 2.0
+    home_speed: float = 300.0        # steps/s, search, back off and return
+    home_slow_speed: float = 120.0   # steps/s, the final approach
+
     # Motion defaults.  The 28BYJ-48 loses steps well before 1000 steps/s.
     default_speed: float = 600.0
     default_accel: float = 2000.0

@@ -364,6 +364,13 @@ The defaults live in `python/deltabot/config.py`:
 | `leg_length_mm` | 40.0 | only used for the estimated Z |
 | `max_radius_mm` | 3.0 | working radius in the plane; moves beyond it are refused |
 | `travel_mm` | 4.0 | firmware soft limit on each screw, either side of zero |
+| `home_direction` | 1, 1, 1 | +1 if a screw reaches its switch by extending (positive steps: nut down), -1 by retracting |
+| `home_offset_mm` | 5.0 | after finding its switch, a screw moves back up this far, and that point is its zero |
+| `home_search_margin_mm` | 1.5 | each screw searches `home_offset_mm` plus this down from where it starts |
+| `home_away_max_mm` | 3.5 | how far the other two screws may move away from their switches while one screw homes |
+| `home_backoff_mm` | 0.2 | back off in steps of this until the switch releases, one more; return quickly to this far short of the trip point, then slowly |
+| `home_release_max_mm` | 2.0 | give up if a switch has not released after backing off this far |
+| `home_speed`, `home_slow_speed` | 300, 120 | steps/s for searching, backing off and returning, and for the final approach |
 
 ### Calibrating the gain
 
@@ -399,7 +406,8 @@ screw stalls or buzzes, drop the speed.
 
 ## First run, in order
 
-1. Centre the stage by hand, then `zero`.
+1. Centre the stage by hand, then `zero`. With the switches fitted,
+   `calhome` replaces this step (see Homing).
 2. `jog 0 0.2` and check screw 0 extends and the plate moves along screw 0's
    direction. If the screw runs the wrong way, set `direction[0] = -1`; if the
    plate moves opposite to the leg, the gain is negative. Repeat for 1 and 2.
@@ -408,8 +416,9 @@ screw stalls or buzzes, drop the speed.
    centre. Lumpy or elliptical usually means one screw is stalling.
 5. Set `radius` and `limits` to what the flexures will actually take.
 
-There are no endstops, so zero is wherever you last said it was, and a stall
-loses that reference: re-`zero` after any stall or `halt`.
+The limit switches only stop motion; they do not set zero. Zero is wherever you
+last said it was, and a stall loses that reference: re-`zero` after any stall,
+`halt` or limit switch stop.
 
 ## Wiring notes
 
@@ -420,12 +429,165 @@ loses that reference: re-`zero` after any stall or `halt`.
 - The step/dir pins at the top of the firmware (`7/4`, `6/3`, `5/2`) are the
   ones from the original demo sketch. If an axis will not move, swap the two
   numbers for it - GRBL shield versions differ on which pin is which.
+- Positive steps should drive every nut down towards its limit switch. That
+  is clockwise seen from the back of the motor, or anticlockwise from the
+  shaft end. `DIR_INVERT` at the top of the firmware flips a motor that turns
+  the other way. On this machine it is `{true, false, true}`, because motor 1
+  is wired the other way round to motors 0 and 2. Check with `raw J n 400`
+  for each motor.
+- Limit switches: `D9`, `D10` and `D11`, normally closed contact to GND. See
+  [Wiring the limit switches](#wiring-the-limit-switches).
+
+## Limit switches
+
+If a switch trips while its screw is moving, all three screws stop dead and
+the firmware sends `limit n`. `move_*`, `jog` and scans then raise
+`DeltaBotError`. The firmware remembers which way the screw was going and
+rejects any further move that way (`err limit n`) until the switch is released.
+Moves back off the switch are always allowed. Once it is released, re-`zero`
+or check the position, because the hard stop may have lost steps.
+
+`bot.limit_switches()` returns the three switch states, and `status` in the
+console shows them. A switch that is already tripped at power-up (including a
+broken wire), or is pressed by hand while its screw is idle, blocks nothing, because the firmware has no
+direction to block.
+
+### Wiring the limit switches
+
+Fit one switch per screw, so it is pressed as the screw nears the end of its
+travel in the `home_direction` it is set up for. Use the switch's normally
+closed (NC) contact, and wire it between the Nano pin and GND:
+
+| Screw | Driver on shield | Nano pin | Switch COM | Switch NC | Switch NO |
+| --- | --- | --- | --- | --- | --- |
+| 0 | X | `D9` | GND | `D9` | not connected |
+| 1 | Y | `D10` | GND | `D10` | not connected |
+| 2 | Z | `D11` | GND | `D11` | not connected |
+
+```
+          Nano / GRBL shield                 microswitch
+     D9 (or D10, D11)  o-------------------o NC
+                                              \   (closed when not pressed)
+     GND               o-------------------o COM
+                                           o NO   (leave unconnected)
+```
+
+No resistors are needed, and no 5V wire goes out to the switches. The
+firmware turns on the Nano's internal pull-up on each pin. The pin reads:
+
+| Condition | Pin | Firmware reads |
+| --- | --- | --- |
+| switch not pressed (NC contact closed, pin shorted to GND) | LOW | ok |
+| switch pressed (NC contact open, pulled up) | HIGH | tripped |
+| wire broken or connector off | HIGH | tripped |
+
+A wiring fault therefore stops the machine rather than silently disabling a
+switch. It also means that a switch that is not connected shows as tripped.
+
+On the GRBL CNC shield, the endstop headers each have a signal pin and a GND
+pin, and the X and Y endstop headers carry `D9` and `D10`. The Z header is
+`D11` on V3.00 shields but `D12` on V3.51 and later. On those, take the Z
+switch to `D11` directly, or change `LIMIT_PIN` at the top of the firmware to
+`{9, 10, 12}`. The `+` and `-` headers for one axis share a pin, so either
+will do. Check the pin with a meter before trusting the silkscreen.
+
+Motor cables are electrically noisy and the internal pull-up is weak (about
+20 to 50 k). With long switch leads, twist each signal wire with its ground
+wire and keep them away from the motor cables. If you still see false trips,
+add a 100 nF capacitor from the pin to GND at the board.
+
+To check the wiring, watch the switches live. Nothing moves:
+
+```
+python3 -m deltabot --port /dev/ttyUSB0 --switches     # or 'switches' in the console,
+                                                       # watch_switches() in IPython
+```
+
+It prints the three states, then a line each time one changes. Press and
+release each switch a few times, then press Ctrl-C for a verdict per switch:
+
+```
+    0.00 s  0:ok  1:ok  2:TRIPPED
+    1.84 s  switch 0 (D9) pressed  -> TRIPPED   [0:TRIPPED  1:ok  2:TRIPPED]
+    2.10 s  switch 0 (D9) released -> ok        [0:ok  1:ok  2:TRIPPED]
+  switch 0 (D9): 2 changes - working
+  switch 1 (D10): never changed, stayed ok - not pressed, or its pin is shorted to GND
+  switch 2 (D11): never changed, stuck TRIPPED - not reaching GND: check it is ...
+```
+
+With nothing pressed, all three should read `ok`. A switch stuck on `TRIPPED`
+is not connected, is wired to NO instead of NC, has a broken wire, or is on a
+different pin (see the Z header note above). If the firmware is older than
+DeltaBot 1.1, it does not report switches, and the test says so.
+
+To find out which pin a switch is really on, watch every input pin instead
+(firmware 1.2 or later):
+
+```
+python3 -m deltabot --port /dev/ttyUSB0 --pins         # or 'pins' in the console,
+                                                       # watch_pins() in IPython
+```
+
+This lists D2 to D13 and A0 to A5 with their levels and what each is used
+for, then prints a line whenever an input changes. D0 and D1 are the USB
+serial line and are left alone. The firmware turns on the pull-up on every
+unused input too, so a pin with nothing on it reads 1. An unpressed NC switch
+holds its pin at 0, so any spare pin already at 0 is flagged straight away:
+
+```
+  spare pins held at GND - a normally closed switch may be wired here: D12
+    3.12 s  D12  0 -> 1   spare (shield Z limit header on V3.51+)
+```
+
+Press each switch and see which pin answers. Then either move the wire or
+change `LIMIT_PIN` in the firmware. D13 carries the Nano's LED, which fights
+the pull-up, so it may not read cleanly.
+
+### Homing
+
+`calhome` (`bot.calibrate_home()`, `calibrate_home()` in IPython) sets zero
+from the limit switches. The switches trip about 5 mm below neutral, and each
+screw's zero is defined as 5 mm (`home_offset_mm`) above where its switch
+trips. Start with the stage roughly at neutral. Each screw named is homed in
+turn, and each one is finished before the next is touched:
+
+1. If the switch is already pressed, the screw first drives up off it with
+   balanced `home_backoff_mm` steps, stopping as soon as it releases. If it
+   has not released after `home_release_max_mm` (2 mm), it is treated as a
+   wiring fault: homing returns to where it started and stops with an error.
+2. A balanced move drives the nut down onto the switch: that screw moves by
+   `d` and the other two by `-d/2`, so the platform slides along that leg and
+   no preload is added. It searches `home_offset_mm` plus
+   `home_search_margin_mm` (6.5 mm) before giving up and returning to where
+   it started. The other two never go more than `home_away_max_mm` (3.5 mm)
+   away from their switches.
+3. The screw backs off until the switch releases, plus `home_backoff_mm`. It
+   then returns quickly to just short of the switch and finds it again at
+   `home_slow_speed`, so the trip point is repeatable.
+4. A balanced move takes the screw back up 5 mm. That point becomes the
+   screw's zero.
+
+At the end, every homed screw is put on its zero. Screws not named go back to
+where they were and keep their old zero. Soft limits are off while searching,
+and speed and limits are put back afterwards. Homing also clears any preload
+and lost steps on the screws homed.
+
+```
+delta> calhome              # all three, in order 0, 1, 2
+delta> calhome 2            # screw 2 only
+delta> calhome 0 2          # screws 0 and 2, in that order
+```
+
+`findhome` is the same command under its older name. The soft limits
+(`travel_mm`, 4 mm either side of zero) keep ordinary moves above the switches.
+Homing all three takes about 8 minutes at the default `home_speed` of 300 steps/s. If a motor stalls, lower `home_speed` further.
 
 ## Serial protocol
 
 The firmware knows nothing about geometry or the over-constraint: it speaks
 steps, one ASCII command per line, and answers `ok` or `err <reason>`. An
-unsolicited `done` marks the end of a move. Usable from a plain serial monitor
+unsolicited `done` marks the end of a move, or `limit n` if switch `n` cut it
+short. Usable from a plain serial monitor
 at 115200 baud.
 
 | Command | Meaning |
@@ -434,12 +596,13 @@ at 115200 baud.
 | `R a b c` | move by a relative number of steps |
 | `J n d` | jog axis `n` (0-2) by `d` steps |
 | `P` | report position: `pos a b c` |
-| `?` | full status line |
+| `?` | full status line, ending `sw a b c` (1 = switch tripped) |
 | `V v` / `A a` | max speed (steps/s) / acceleration (steps/s^2) |
 | `E 0\|1` | disable / enable the drivers |
 | `Z [a b c]` | set the current position as zero, or to a b c |
-| `B lo hi` | soft limits in steps (`lo == hi` disables them) |
+| `B lo hi` | soft limits in steps (`lo == hi` disables them); a move that brings an axis back towards them is always allowed |
 | `S` / `X` | stop with deceleration / stop immediately |
+| `I` | raw pin levels: `pins <D2..D13> <A0..A5>`, one 0/1 digit per pin |
 | `$` | command summary |
 
 Moves are coordinated: the axis with the furthest to travel runs at the full

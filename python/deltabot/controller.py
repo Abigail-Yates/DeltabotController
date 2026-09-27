@@ -8,7 +8,7 @@ strains the flexures.  See :mod:`deltabot.kinematics`.
 """
 
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import Connection, Geometry
 from .kinematics import (Pose, common_mode, estimate_z, pose_to_screws,
@@ -58,6 +58,7 @@ class DeltaBot:
         self.conn = Connection(port=port, baud=baud, timeout=timeout)
         self.serial = None
         self.banner = ""
+        self.limit_hits: List[int] = []     # switches tripped since the last move began
         if connect:
             self.open()
 
@@ -75,8 +76,8 @@ class DeltaBot:
             port = find_port() if self.conn.port == "auto" else self.conn.port
             self.serial = serial.Serial(port, self.conn.baud, timeout=self.conn.timeout)
             self.conn.port = port
-            time.sleep(self.conn.reset_delay)   # the Nano reboots on open
-            self.serial.reset_input_buffer()
+            time.sleep(self.conn.reset_delay)   # the Nano reboots on open; its
+                                                # banner waits in the buffer
 
         self.banner = self._drain_banner()
         self.set_speed(self.geometry.default_speed)
@@ -109,7 +110,7 @@ class DeltaBot:
                 break
             lines.append(raw.decode(errors="replace").strip())
             if "ready" in lines[-1]:
-                break
+                return lines[-1]             # skip any bootloader noise before it
         return " / ".join(l for l in lines if l)
 
     def command(self, text: str, timeout: float = 5.0) -> List[str]:
@@ -125,6 +126,9 @@ class DeltaBot:
                 continue
             line = raw.decode(errors="replace").strip()
             if not line or line == "done":      # completion of an earlier move
+                continue
+            if line.startswith("limit"):         # a limit switch stopped a move
+                self.limit_hits.append(int(line.split()[1]))
                 continue
             if line == "ok":
                 return data
@@ -144,15 +148,42 @@ class DeltaBot:
         i = 2
         while i < len(tokens):
             key = tokens[i]
-            if key in ("pos", "tgt", "limits"):
-                width = 3 if key in ("pos", "tgt") else 2
+            if key in ("pos", "tgt", "limits", "sw"):
+                width = 2 if key == "limits" else 3
                 out[key] = [int(t) for t in tokens[i + 1:i + 1 + width]]
                 i += width + 1
             else:
                 out[key] = float(tokens[i + 1])
                 i += 2
         out["en"] = bool(out.get("en", 1))
+        if "sw" in out:
+            out["sw"] = [bool(v) for v in out["sw"]]
         return out
+
+    def limit_switches(self) -> List[bool]:
+        """Whether each screw's limit switch is tripped (pressed, or its wire
+        broken)."""
+        s = self.status()
+        if "sw" not in s:
+            raise DeltaBotError(f"the firmware ({self.banner or 'unknown'}) does not report "
+                                "limit switches - flash DeltaBot 1.1 or later")
+        return s["sw"]
+
+    def pin_levels(self) -> Dict[str, int]:
+        """Raw level, 0 or 1, of D2..D13 and A0..A5 (firmware 1.2 or later).
+        Every input has the internal pull-up, so an unused pin reads 1 and a
+        pin that something ties to GND reads 0."""
+        try:
+            lines = self.command("I")
+        except DeltaBotError as exc:
+            raise DeltaBotError(f"the firmware ({self.banner or 'unknown'}) cannot report "
+                                "pin levels - flash DeltaBot 1.2 or later") from exc
+        for line in lines:
+            if line.startswith("pins"):
+                digital, analog = line.split()[1:3]
+                names = [f"D{p}" for p in range(2, 14)] + [f"A{p}" for p in range(6)]
+                return dict(zip(names, (int(c) for c in digital + analog)))
+        raise DeltaBotError("no pin levels returned")
 
     def positions(self) -> List[int]:
         """Current position of each screw, in steps."""
@@ -189,10 +220,14 @@ class DeltaBot:
         return self.status()["moving"]
 
     def wait(self, timeout: float = 300.0, poll: float = 0.05) -> None:
-        """Block until the platform has stopped."""
+        """Block until the platform has stopped.  Raises if a limit switch
+        stopped it short."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.is_moving():
+                if self.limit_hits:
+                    hits = ", ".join(str(i) for i in sorted(set(self.limit_hits)))
+                    raise DeltaBotError(f"limit switch {hits} tripped; motion stopped")
                 return
             time.sleep(poll)
         raise DeltaBotError("timed out waiting for the move to finish")
@@ -201,6 +236,7 @@ class DeltaBot:
     def move_steps(self, a: int, b: int, c: int, relative: bool = False,
                    wait: bool = True) -> None:
         """Move the three screws to (or by) a number of steps."""
+        self.limit_hits = []
         self.command(f"{'R' if relative else 'M'} {int(a)} {int(b)} {int(c)}")
         if wait:
             self.wait()
@@ -262,6 +298,7 @@ class DeltaBot:
         """
         if not 0 <= axis <= 2:
             raise ValueError("axis must be 0, 1 or 2")
+        self.limit_hits = []
         self.command(f"J {axis} {int(steps)}")
         if wait:
             self.wait()
@@ -271,9 +308,9 @@ class DeltaBot:
         self.jog(axis, self.geometry.mm_to_steps(axis, mm), wait=wait)
 
     def home(self, wait: bool = True) -> None:
-        """Return every screw to zero, and so the platform to centre (the
-        machine has no endstops, so zero is wherever :meth:`zero` was last
-        called)."""
+        """Return every screw to zero, and so the platform to centre (zero
+        is wherever :meth:`zero` was last called; the limit switches only stop
+        motion, they do not set it)."""
         self.move_steps(0, 0, 0, wait=wait)
 
     def stop(self) -> None:
@@ -283,6 +320,167 @@ class DeltaBot:
     def halt(self) -> None:
         """Stop dead.  Steps may be lost, so re-zero afterwards."""
         self.command("X")
+
+    # -------------------------------------------------------------- homing
+    def _balanced(self, axis: int, mm: float) -> List[float]:
+        """Relative screw moves that drive screw ``axis`` by ``mm`` and the
+        other two by half as much the other way.  They sum to zero, so the
+        platform moves along that leg and nothing goes into preload.
+
+        There is no switch on the far side, so the other two are never taken
+        more than ``home_away_max_mm`` away from their own switches from
+        where this screw's homing started; past that the
+        homing screw carries on alone."""
+        g = self.geometry
+        current = self.extensions()
+        moves = [0.0, 0.0, 0.0]
+        moves[axis] = mm
+        for other in range(3):
+            if other == axis:
+                continue
+            away = -g.home_direction[other]
+            limit = self._home_start[other] + away * g.home_away_max_mm
+            target = current[other] - mm / 2.0
+            if away * (target - limit) > 0:
+                target = limit
+            moves[other] = target - current[other]
+        return moves
+
+    def _seek_switch(self, axis: int, mm: float, speed: float) -> int:
+        """Drive screw ``axis`` up to ``mm`` towards its switch, balanced, and
+        return its step position when the switch tripped."""
+        g = self.geometry
+        self.set_speed(speed)
+        try:
+            self.move_extensions(self._balanced(axis, g.home_direction[axis] * mm),
+                                 relative=True)
+        except DeltaBotError:
+            if set(self.limit_hits) == {axis}:
+                return self.positions()[axis]
+            raise
+        raise DeltaBotError(f"switch {axis} did not trip within {mm:.2f} mm")
+
+    def _back_off(self, axis: int, max_mm: float) -> float:
+        """Move screw ``axis`` off its switch, balanced, in ``home_backoff_mm``
+        steps until it releases (a switch releases later than it trips), then
+        one step more for a run up.  Returns the distance backed off."""
+        g = self.geometry
+        self.set_speed(g.home_speed)
+        step = g.home_backoff_mm
+        backed = 0.0
+        while True:
+            self.move_extensions(self._balanced(axis, -g.home_direction[axis] * step),
+                                 relative=True)
+            backed += step
+            time.sleep(0.05)                 # the firmware debounces the release
+            if not self.limit_switches()[axis]:
+                break
+            if backed >= max_mm - 1e-9:
+                raise DeltaBotError(
+                    f"switch {axis} still reads tripped after backing off {backed:.2f} mm. "
+                    f"With normally closed wiring that means its pin (D{9 + axis}) is not "
+                    "reaching GND: check the switch is connected, COM goes to GND and "
+                    "NC (not NO) to the pin, and the firmware is 1.1 or later. 'status' "
+                    "shows all three switches")
+        self.move_extensions(self._balanced(axis, -g.home_direction[axis] * step),
+                             relative=True)
+        return backed + step
+
+    def _approach(self, axis: int, backed: float) -> int:
+        """Having backed ``backed`` mm off a switch, return quickly to one
+        ``home_backoff_mm`` short of where it tripped, then find it slowly.
+        Returns the step position at which it tripped."""
+        g = self.geometry
+        step = g.home_backoff_mm
+        self.set_speed(g.home_speed)
+        try:
+            self.move_extensions(self._balanced(axis, g.home_direction[axis] * (backed - step)),
+                                 relative=True)
+        except DeltaBotError:
+            if set(self.limit_hits) != {axis}:
+                raise
+            # It tripped early; back off again and make the whole approach slowly.
+            backed = self._back_off(axis, g.home_release_max_mm)
+            return self._seek_switch(axis, backed + step, g.home_slow_speed)
+        return self._seek_switch(axis, 2 * step, g.home_slow_speed)
+
+    def _home_axis(self, axis: int) -> None:
+        """Home one screw from roughly neutral: a balanced move down onto its
+        switch, a slow second approach, then a balanced move back up by
+        ``home_offset_mm``, which becomes that screw's zero."""
+        g = self.geometry
+        if self.limit_switches()[axis]:
+            # Already on the switch: drive off it first, a step at a time,
+            # stopping as soon as it releases.  If it has not released after
+            # home_release_max_mm it is wiring, and _back_off says so.
+            start = self.positions()
+            self._home_start = self.extensions()
+            try:
+                self._back_off(axis, g.home_release_max_mm)
+            except DeltaBotError:
+                try:
+                    self.set_speed(g.home_speed)
+                    self.move_steps(*start)
+                except DeltaBotError:
+                    pass
+                raise
+        start = self.positions()
+        self._home_start = self.extensions()
+        try:
+            self._seek_switch(axis, g.home_offset_mm + g.home_search_margin_mm,
+                              g.home_speed)
+            backed = self._back_off(axis, g.home_release_max_mm)
+            self._approach(axis, backed)
+        except DeltaBotError:
+            try:                             # leave the platform where it started
+                self.set_speed(g.home_speed)
+                self.move_steps(*start)
+            except DeltaBotError:
+                pass
+            raise
+        self.set_speed(g.home_speed)
+        self.move_extensions(self._balanced(axis, -g.home_direction[axis] * g.home_offset_mm),
+                             relative=True)
+        pos = self.positions()
+        pos[axis] = 0
+        self.zero(pos)
+
+    def find_home(self, axes: Sequence[int] = (0, 1, 2)) -> None:
+        """Set zero from the limit switches, one screw at a time.
+
+        Start with the stage roughly at neutral.  Each screw in ``axes`` is
+        taken in turn: a balanced move (that screw by ``d``, the other two by
+        ``-d/2``, so the platform slides along that leg and nothing goes into
+        preload) drives its nut down onto its switch; it backs off and finds
+        the switch again slowly; then a balanced move takes it back up by
+        ``home_offset_mm`` and that point becomes the screw's zero.  At the
+        end every homed screw is put on its zero; screws not in ``axes`` go
+        back where they were and keep their current zero.  This also clears any preload
+        and lost steps on the screws homed.
+
+        Soft limits are off while searching, since the position is not yet
+        trusted; speed and limits are put back afterwards, even on error.
+        """
+        axes = list(dict.fromkeys(int(a) for a in axes))
+        if not axes or any(not 0 <= a <= 2 for a in axes):
+            raise ValueError("axes must be drawn from 0, 1 and 2")
+        before = self.status()
+        self.command("B 0 0")
+        try:
+            for axis in axes:
+                self._home_axis(axis)
+            # Each screw's balanced moves nudge the others by half the
+            # difference between its switch distance and home_offset_mm; put
+            # every homed screw on its zero and the rest back where they were.
+            target = list(before["pos"])
+            for axis in axes:
+                target[axis] = 0
+            self.move_steps(*target)
+        finally:
+            self.set_speed(before["speed"])
+            self.command("B %d %d" % tuple(before["limits"]))
+
+    calibrate_home = find_home
 
     # ---------------------------------------------------------- parameters
     def zero(self, positions: Optional[Sequence[int]] = None) -> None:
