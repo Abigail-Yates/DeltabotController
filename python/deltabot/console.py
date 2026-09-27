@@ -63,6 +63,41 @@ def watch_switches(bot: DeltaBot, seconds: Optional[float] = None,
     return counts
 
 
+def show_pose(bot: DeltaBot) -> None:
+    """Print where the platform is and each screw's extension."""
+    extensions = bot.extensions()
+    strain = common_mode(extensions)
+    print(f"  {bot.pose()}   z~{bot.z():+.4f} mm")
+    print("  screws  " + "  ".join(f"{i}:{h:+.4f} mm" for i, h in enumerate(extensions))
+          + (f"   preload {strain:+.4f} mm" if abs(strain) > 1e-6 else ""))
+
+
+def print_status(bot: DeltaBot) -> dict:
+    """Print the full machine state, as the console's 'status' does."""
+    s = bot.status()
+    print(f"  port {bot.conn.port}  {'MOVING' if s['moving'] else 'idle'}  "
+          f"drivers {'on' if s['en'] else 'off'}")
+    print(f"  steps   {s['pos'][0]} {s['pos'][1]} {s['pos'][2]}   "
+          f"speed {s['speed']:.0f} steps/s   accel {s['accel']:.0f} steps/s^2")
+    print(f"  limits  {s['limits'][0]} .. {s['limits'][1]} steps "
+          f"(+/-{s['limits'][1] / bot.geometry.steps_per_mm:.2f} mm)")
+    if "sw" in s:
+        print(f"  switches {_switch_line(s['sw'])}")
+    else:
+        print("  switches  not reported - firmware older than DeltaBot 1.1")
+    show_pose(bot)
+    return s
+
+
+def send_raw(bot: DeltaBot, text: str) -> list:
+    """Send one protocol line straight to the firmware and print the reply."""
+    lines = bot.command(text)
+    for line in lines:
+        print("  " + line)
+    print("  ok")
+    return lines
+
+
 # What each pin is for, as the firmware and the GRBL shield use them.
 PIN_ROLES = {
     "D2": "output: dir, screw 2", "D3": "output: dir, screw 1", "D4": "output: dir, screw 0",
@@ -139,12 +174,7 @@ class DeltaBotConsole(cmd.Cmd):
         return [float(p) for p in parts]
 
     def _show(self):
-        pose = self.bot.pose()
-        extensions = self.bot.extensions()
-        strain = common_mode(extensions)
-        print(f"  {pose}   z~{self.bot.z():+.4f} mm")
-        print("  screws  " + "  ".join(f"{i}:{h:+.4f} mm" for i, h in enumerate(extensions))
-              + (f"   preload {strain:+.4f} mm" if abs(strain) > 1e-6 else ""))
+        show_pose(self.bot)
 
     def onecmd(self, line):
         try:
@@ -155,18 +185,7 @@ class DeltaBotConsole(cmd.Cmd):
     # ------------------------------------------------------------ commands
     def do_status(self, arg):
         """status - full machine state."""
-        s = self.bot.status()
-        print(f"  port {self.bot.conn.port}  {'MOVING' if s['moving'] else 'idle'}  "
-              f"drivers {'on' if s['en'] else 'off'}")
-        print(f"  steps   {s['pos'][0]} {s['pos'][1]} {s['pos'][2]}   "
-              f"speed {s['speed']:.0f} steps/s   accel {s['accel']:.0f} steps/s^2")
-        print(f"  limits  {s['limits'][0]} .. {s['limits'][1]} steps "
-              f"(+/-{s['limits'][1] / self.bot.geometry.steps_per_mm:.2f} mm)")
-        if "sw" in s:
-            print(f"  switches {_switch_line(s['sw'])}")
-        else:
-            print("  switches  not reported - firmware older than DeltaBot 1.1")
-        self._show()
+        print_status(self.bot)
 
     def do_pose(self, arg):
         """pose - where the platform is in the plane."""
@@ -335,9 +354,7 @@ class DeltaBotConsole(cmd.Cmd):
 
     def do_raw(self, arg):
         """raw <command> - send a protocol line straight to the firmware."""
-        for line in self.bot.command(arg):
-            print("  " + line)
-        print("  ok")
+        send_raw(self.bot, arg)
 
     def do_ports(self, arg):
         """ports - list the serial ports on this machine."""

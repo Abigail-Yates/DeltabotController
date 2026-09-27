@@ -113,9 +113,13 @@ else. Options after `--`:
 
 ```python
 wh()                        # where is it
+status()                    # full machine state, including the limit switches
 zero()                      # make the current position the origin
+calibrate_home()            # or calibrate_home(2): zero from the limit switches
 mv(0.5, 0)                  # absolute move, mm
 mvr(dy=-0.1)                # relative move
+raw("J 1 -2000")            # any firmware command, reply printed
+watch_switches()            # live switch test, Ctrl-C to stop (watch_pins() for every pin)
 
 # set up detection in the viewer (or with its GUI)
 cam.remote.enable_hough(min_radius=20, max_radius=60, param2=25)

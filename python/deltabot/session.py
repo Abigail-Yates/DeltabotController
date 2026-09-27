@@ -17,6 +17,7 @@ The prompt then has:
     zero()                                        current position becomes the origin
     calibrate_home(*screws)  find_home(*screws)   zero from the limit switches
     watch_switches()  watch_pins()                live switch / pin test, Ctrl-C to stop
+    status()  raw("J 1 -2000")                    full machine state / a firmware command
     ascan  dscan  mesh  dmesh  mmesh  dmmesh  run_scan  count
     Circles  Peaks  SaveImage  Custom
     load_scan  connect_camera  scanner
@@ -27,6 +28,7 @@ import atexit
 
 from .camera import Camera
 from .config import Geometry
+from .console import print_status, send_raw
 from .console import watch_pins as _watch_pins
 from .console import watch_switches as _watch_switches
 from .controller import DeltaBot
@@ -136,6 +138,16 @@ def main(argv=None) -> dict:
 
     calibrate_home = find_home
 
+    def status():
+        """Full machine state: motion, steps, speed, soft limits, switches
+        and position - the console's 'status'."""
+        print_status(bot)
+
+    def raw(command):
+        """Send one protocol line straight to the firmware and print the
+        reply, e.g. raw("J 1 -2000") or raw("?").  Returns the reply lines."""
+        return send_raw(bot, command)
+
     def watch_switches(seconds=None):
         """Print each limit switch change live until Ctrl-C; nothing moves."""
         return _watch_switches(bot, seconds)
@@ -152,6 +164,7 @@ def main(argv=None) -> dict:
         wh=wh, mv=mv, mvr=mvr, wm=wm, mvm=mvm, mvrm=mvrm, zero=zero,
         find_home=find_home, calibrate_home=calibrate_home,
         watch_switches=watch_switches, watch_pins=watch_pins,
+        status=status, raw=raw,
         ascan=scanner.ascan, dscan=scanner.dscan, mesh=scanner.mesh,
         dmesh=scanner.dmesh, mmesh=scanner.mmesh, dmmesh=scanner.dmmesh,
         run_scan=scanner.run, count=scanner.count,
