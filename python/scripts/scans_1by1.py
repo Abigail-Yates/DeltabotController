@@ -2,9 +2,12 @@ from deltabot import DeltaBot
 from deltabot import scan
 from deltabot import camera
 import csv
-# import numpy as np
+import numpy as np
 import pandas as pd
-# import tensorflow as tf
+import tensorflow as tf
+from joblib import dump, load
+from sklearn.preprocessing import StandardScaler
+
 
 from preprocessing import process_the_data
 
@@ -42,12 +45,12 @@ def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
 	return agg
 
 
-with DeltaBot() as bot:  # port="sim" to try it without hardware
+with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
     cam = camera.Camera()
     # sc = scan.Scanner(bot, cam, data_dir="scans/data")
     hough = cam.remote.enable_hough(min_radius=4, max_radius=7, param2=20, min_dist=50)
 
-    window_size = 10
+    window_size = 1
 
     # first 10 steps to get history
     fh = open("data.csv", "w", newline="")
@@ -55,7 +58,7 @@ with DeltaBot() as bot:  # port="sim" to try it without hardware
     with fh:
         for y in [0]:
             for x in [x / 10.0 for x in range(window_size+ 1)]:
-                pose = bot.move_xy(x, y, scan.Circles())
+                pose = bot.move_xy(x, y, scan.Circles()) #, scan.TrackedCircle())
                 # print(bot.positions())
 
                 # print(scan.Circles().read(frame, None))
@@ -104,21 +107,36 @@ with DeltaBot() as bot:  # port="sim" to try it without hardware
 
             inputs.to_csv(f"window_{window_size}_test.csv")
 
-            # np.savetxt("test.csv", inputs.astype("float16"), delimiter=',')
-
             #need to scale data
+
+            bot_test = inputs
+            bot_test.iloc[[-1]]
+
+            scalerX = load('scalerX.bin')
+            scalerY = load('scalerY.bin')
+
+            bot_test_scaled = scalerX.transform(bot_test.iloc[[-1]])
+
+
+
             
             #use values to predict steps
-            #model = tf.keras.models.load_model('model.keras') #need to work out how to get tf installed
+            model = tf.keras.models.load_model(f'window_{window_size}.keras') #need to work out how to get tf installed
+
+            bot_test_pred = model.predict(bot_test_scaled)
+            bot_test_pred_inverse = scalerY.inverse_transform(bot_test_pred)
+            bot_test_pred_inverse = np.append(bot_test_pred_inverse, -(bot_test_pred_inverse[:,0] + bot_test_pred_inverse[:,1])) #calculate s2
+            print(bot_test_pred_inverse.astype("int32")) 
             
             #need to inverse transform
 
-            pred_s0 =int(input("predicted s0: "))  #[1000,0,0] #model.predict(inputs) #need to work out how to get tf installed - test data for now
-            pred_s1 =int(input("predicted s1: ")) 
-            pred_s2 =int(input("predicted s2: ")) 
+            # pred_s0 =int(input("predicted s0: "))  #[1000,0,0] #model.predict(inputs) #need to work out how to get tf installed - test data for now
+            # pred_s1 =int(input("predicted s1: ")) 
+            # pred_s2 =int(input("predicted s2: ")) 
             
             #move bot
-            bot.move_steps(pred_s0, pred_s1, pred_s2) #probably will fail formatting 
+            # bot.move_steps(pred_s0, pred_s1, pred_s2) 
+            bot.move_steps(bot_test_pred_inverse[0], bot_test_pred_inverse[1], bot_test_pred_inverse[2]) 
             
             #measure cx, cy
             frame_new = cam.acquire(hough=hough)
