@@ -117,9 +117,7 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
 
             bot_test_scaled = scalerX.transform(bot_test.iloc[[-1]])
 
-
-
-            
+         
             #use values to predict steps
             model = tf.keras.models.load_model(f'window_{window_size}.keras') #need to work out how to get tf installed
 
@@ -130,7 +128,7 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
             
             #need to inverse transform
 
-            # pred_s0 =int(input("predicted s0: "))  #[1000,0,0] #model.predict(inputs) #need to work out how to get tf installed - test data for now
+            # pred_s0 =int(input("predicted s0: "))
             # pred_s1 =int(input("predicted s1: ")) 
             # pred_s2 =int(input("predicted s2: ")) 
             
@@ -152,6 +150,7 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
             new_data = process_the_data("", "", 0.1 / 11, 0.1 / 11, initial_pos["cx"], initial_pos["cy"])
 
             #compare!
+            print("desired position: ", next_x, next_y)
             print("new position: \n", new_data[["cx_mm", "cy_mm", "s0", "s1", "s2"]]) #.iloc[-1]
 
     # sc.run([(0, 0)] * 2, scan.Circles(), scan.TrackedCircle(roi_width=280), settle=1.0, name="0,0")
