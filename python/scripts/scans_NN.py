@@ -8,63 +8,35 @@ import tensorflow as tf
 from joblib import dump, load
 from sklearn.preprocessing import StandardScaler
 
-
-from preprocessing import process_the_data
-
-def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
-	"""
-	Frame a time series as a supervised learning dataset.
-	Arguments:
-		data: Sequence of observations as a list or NumPy array.
-		n_in: Number of lag observations as input (X).
-		n_out: Number of observations as output (y).
-		dropnan: Boolean whether or not to drop rows with NaN values.
-	Returns:
-		Pandas DataFrame of series framed for supervised learning.
-	"""
-	n_vars = 1 if type(data) is list else data.shape[1]
-	df = pd.DataFrame(data)
-	cols, names = list(), list()
-	# input sequence (t-n, ... t-1)
-	for i in range(n_in, 0, -1):
-		cols.append(df.shift(i))
-		names += [('var%d(t-%d)' % (j+1, i)) for j in range(n_vars)]
-	# forecast sequence (t, t+1, ... t+n)
-	for i in range(0, n_out):
-		cols.append(df.shift(-i))
-		if i == 0:
-			names += [('var%d(t)' % (j+1)) for j in range(n_vars)]
-		else:
-			names += [('var%d(t+%d)' % (j+1, i)) for j in range(n_vars)]
-	# put it all together
-	agg = pd.concat(cols, axis=1)
-	agg.columns = names
-	# drop rows with NaN values
-	if dropnan:
-		agg.dropna(inplace=True)
-	return agg
+from processing import process_the_data, series_to_supervised
 
 
-with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
+"""Basic script which 
+    1. drives the bot window_size steps using the normal DeltabotController Algorithm
+    2. asks the user for input for the next desired position of the bot (Note: there is no error handling for non-float inputs.)
+    3. uses a neural network (saved/imported .keras file) to predict the motor steps needed to get to that location
+    4. drives the bot to the new neural network steps. 
+    5. repeates steps 2. to 4. indefinitely (until the user ctrl-c)
+    """
+
+with DeltaBot() as bot:  # port="sim" to try it without hardware
     cam = camera.Camera()
     # sc = scan.Scanner(bot, cam, data_dir="scans/data")
-    hough = cam.remote.enable_hough(min_radius=4, max_radius=7, param2=20, min_dist=50)
+    hough = cam.remote.enable_hough(min_radius=5, max_radius=9, param2=22, min_dist=50)
 
-    window_size = 1
+    window_size = 10
 
-    # first 10 steps to get history
+    # first window_size steps to get history
     fh = open("data.csv", "w", newline="")
     writer = None
     with fh:
         for y in [0]:
-            for x in [x / 10.0 for x in range(window_size+ 1)]:
+            for x in [-x / 10.0 for x in range(window_size+ 1)]:
                 pose = bot.move_xy(x, y, scan.Circles()) #, scan.TrackedCircle())
-                # print(bot.positions())
 
-                # print(scan.Circles().read(frame, None))
                 frame = cam.acquire(hough=hough)
 
-                row = {"x": pose.x, "y": pose.y}  # need to add cx and cy in here somehow
+                row = {"x": pose.x, "y": pose.y}
                 row["frame_id"] = frame.frame_id
                 steps = bot.positions()
                 row.update({"s0": steps[0], "s1": steps[1], "s2": steps[2]})
@@ -78,20 +50,21 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
                 fh.flush()
 
 
-        while(True):
+        while(True): #infinitely predict next steps 
+
             #convert measured cx and cy values into mm
-            data = process_the_data("", "", 0.1 / 11, 0.1 / 11, initial_pos["cx"], initial_pos["cy"])
-            # print("data ", data)
+            px_per_mm = 11.85
+            data = process_the_data("", "", 0.1 / px_per_mm, 0.1 / px_per_mm, initial_pos["cx"], initial_pos["cy"])
             data_processed = data[["cx_mm", "cy_mm", "s0", "s1", "s2"]]
-            #convert measured values into a window of history - so neural network knows where it has been
-            
+
+            #convert measured values into a window of history - so neural network knows where it has been 
             series = series_to_supervised(data_processed, window_size-1, 1)
 
             print("series \n", series)
             
-            inputs = series #.drop(["var1(t)", "var2(t)", "var3(t)", "var4(t)", "var5(t)"], axis=1)
+            inputs = series
 
-            #gather from user where it should go next
+            #gather from user where bot should go next
             print("current position: \n", data_processed.iloc[-1])
             next_x = input("x:") 
             next_y = input("y:")
@@ -100,40 +73,32 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
             inputs["var2(t+1)"] = float(next_y)
             inputs["cx_diff"] = inputs["var1(t+1)"] - inputs["var1(t)"]
             inputs["cy_diff"] = inputs["var2(t+1)"] - inputs["var2(t)"]
-            # print(inputs)
             inputs = inputs[1:]
             
             print("inputs: \n", inputs)
 
             inputs.to_csv(f"window_{window_size}_test.csv")
 
-            #need to scale data
-
+            #scale data
             bot_test = inputs
             bot_test.iloc[[-1]]
 
-            scalerX = load('scalerX.bin')
-            scalerY = load('scalerY.bin')
+            scalerX = load(f'scalerX_{window_size}.bin') #from training data
+            scalerY = load(f'scalerY_{window_size}.bin') #from training data
 
             bot_test_scaled = scalerX.transform(bot_test.iloc[[-1]])
 
          
-            #use values to predict steps
-            model = tf.keras.models.load_model(f'window_{window_size}.keras') #need to work out how to get tf installed
-
+            #use model to predict steps
+            model = tf.keras.models.load_model(f'window_{window_size}_dropout.keras') #need to work out how to get tf installed
             bot_test_pred = model.predict(bot_test_scaled)
+
+            #inverse transform to conver to motor steps
             bot_test_pred_inverse = scalerY.inverse_transform(bot_test_pred)
             bot_test_pred_inverse = np.append(bot_test_pred_inverse, -(bot_test_pred_inverse[:,0] + bot_test_pred_inverse[:,1])) #calculate s2
             print(bot_test_pred_inverse.astype("int32")) 
-            
-            #need to inverse transform
-
-            # pred_s0 =int(input("predicted s0: "))
-            # pred_s1 =int(input("predicted s1: ")) 
-            # pred_s2 =int(input("predicted s2: ")) 
-            
-            #move bot
-            # bot.move_steps(pred_s0, pred_s1, pred_s2) 
+             
+            #move bot to predicted steps value
             bot.move_steps(bot_test_pred_inverse[0], bot_test_pred_inverse[1], bot_test_pred_inverse[2]) 
             
             #measure cx, cy
@@ -143,17 +108,14 @@ with DeltaBot(port="sim") as bot:  # port="sim" to try it without hardware
             row.update({"s0": steps[0], "s1": steps[1], "s2": steps[2]})
             row.update(dict(scan.Circles().read(frame_new, None)))
 
-
             #process cx, cy
             writer.writerow(row)
             fh.flush()
-            new_data = process_the_data("", "", 0.1 / 11, 0.1 / 11, initial_pos["cx"], initial_pos["cy"])
+            new_data = process_the_data("", "", 0.1 / px_per_mm, 0.1 / px_per_mm, initial_pos["cx"], initial_pos["cy"])
 
             #compare!
             print("desired position: ", next_x, next_y)
             print("new position: \n", new_data[["cx_mm", "cy_mm", "s0", "s1", "s2"]]) #.iloc[-1]
-
-    # sc.run([(0, 0)] * 2, scan.Circles(), scan.TrackedCircle(roi_width=280), settle=1.0, name="0,0")
 
 
     bot.home
